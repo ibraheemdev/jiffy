@@ -98,96 +98,103 @@ pub struct IndexQueue {
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
     threshold: CachePadded<AtomicIsize>,
-    entries: CachePadded<Box<[AtomicUsize]>>,
+    slots: CachePadded<Box<[AtomicUsize]>>,
 }
 
 impl IndexQueue {
     pub fn empty(order: usize) -> IndexQueue {
+        let capacity = 1 << order;
+
+        // the number of slots is double the capacity
+        // such that the last dequeuer can always locate
+        // an unused slot no farther than 2*capacity slots
+        // away from the last enqueuer
+        let slots = capacity * 2;
+
         IndexQueue {
             head: CachePadded(AtomicUsize::new(0)),
             tail: CachePadded(AtomicUsize::new(0)),
             threshold: CachePadded(AtomicIsize::new(-1)),
-            entries: CachePadded(
+            slots: CachePadded(
                 iter::repeat(-1_isize as usize)
                     .map(AtomicUsize::new)
-                    // double capacity
-                    .take(1 << (order + 1))
+                    .take(slots)
                     .collect(),
             ),
         }
     }
 
     pub fn full(order: usize) -> IndexQueue {
-        let half = 1 << order;
-        let cap = half * 2;
+        let capacity = 1 << order;
+        let slots = capacity * 2;
 
         let mut entries = iter::repeat(-1_isize as _)
             .map(AtomicUsize::new)
-            .take(cap)
+            .take(slots)
             .collect::<Box<[_]>>();
 
-        for i in 0..half {
+        // initialize the first slots
+        for i in 0..capacity {
             entries[i] = AtomicUsize::new(i);
         }
 
         IndexQueue {
             head: CachePadded(AtomicUsize::new(0)),
-            tail: CachePadded(AtomicUsize::new(half)),
-            threshold: CachePadded(AtomicIsize::new(IndexQueue::threshold(half, cap))),
-            entries: CachePadded(entries),
+            tail: CachePadded(AtomicUsize::new(capacity)),
+            threshold: CachePadded(AtomicIsize::new(IndexQueue::threshold(capacity, slots))),
+            slots: CachePadded(entries),
         }
     }
 
     pub fn push(&self, index: usize, order: usize) {
-        let half = 1 << order;
-        let cap = half * 2;
-        let index = index ^ (cap - 1);
+        let capacity = 1 << order;
+        let slots = capacity * 2;
+        let index = index ^ (slots - 1);
 
         'next: loop {
-            // acquire an entry
+            // acquire a slot
             let tail = self.tail.fetch_add(1, Ordering::AcqRel);
-            let tail_cycle = (tail << 1) | (2 * cap - 1);
-            let tail_index = tail & (cap - 1);
+            let tail_index = tail & (slots - 1);
+            let cycle = (tail << 1) | (2 * slots - 1);
 
-            let mut entry = unsafe {
-                self.entries
-                    .get_unchecked(tail_index)
-                    .load(Ordering::Acquire)
-            };
+            let mut slot = unsafe { self.slots.get_unchecked(tail_index).load(Ordering::Acquire) };
 
             'retry: loop {
-                let entry_cycle = entry | (2 * cap - 1);
+                let slot_cycle = slot | (2 * slots - 1);
 
-                // the entry is from a newer cycle
-                if wrapping_cmp!(entry_cycle, >=, tail_cycle) {
+                // the slot is from a newer cycle, move to
+                // the next one
+                if wrapping_cmp!(slot_cycle, >=, cycle) {
                     continue 'next;
                 }
 
-                if entry == entry_cycle
-                    || (entry == (entry_cycle ^ cap)
+                // we can safely read the entry if either:
+                // - the entry is safe and unused
+                // - the entry is marked as unsafe but
+                //   the head is still behind the tail
+                if slot == slot_cycle
+                    || (slot == slot_cycle ^ slots
                         && wrapping_cmp!(self.head.load(Ordering::Acquire), <=, tail))
                 {
-                    let new_entry = tail_cycle ^ index;
+                    // mark the entry as safe
+                    let new_entry = cycle ^ index;
 
                     unsafe {
-                        if let Err(e) = self
-                            .entries
-                            .get_unchecked(tail_index)
-                            .compare_exchange_weak(
-                                entry,
-                                new_entry,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                        {
-                            entry = e;
+                        if let Err(e) = self.slots.get_unchecked(tail_index).compare_exchange_weak(
+                            slot,
+                            new_entry,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            slot = e;
                             continue 'retry;
                         }
                     }
 
-                    let threshold = IndexQueue::threshold(half, cap);
+                    let threshold = IndexQueue::threshold(capacity, slots);
+
+                    // reset the threshold
                     if self.threshold.load(Ordering::Acquire) != threshold {
-                        // reset the threshold
                         self.threshold.store(threshold, Ordering::Release);
                     }
 
@@ -205,74 +212,75 @@ impl IndexQueue {
             return None;
         }
 
-        let cap = 1 << (order + 1);
+        let slots = 1 << (order + 1);
 
-        loop {
-            // release an entry
+        'next: loop {
+            // acquire a slot
             let head = self.head.fetch_add(1, Ordering::AcqRel);
-            let head_cycle = (head << 1) | (2 * cap - 1);
-            let head_index = head & (cap - 1);
+            let head_index = head & (slots - 1);
+            let cycle = (head << 1) | (2 * slots - 1);
 
-            let mut entry = unsafe {
-                self.entries
-                    .get_unchecked(head_index)
-                    .load(Ordering::Acquire)
-            };
+            let mut slot = unsafe { self.slots.get_unchecked(head_index).load(Ordering::Acquire) };
 
-            loop {
-                let entry_cycle = entry | (2 * cap - 1);
+            'retry: loop {
+                let slot_cycle = slot | (2 * slots - 1);
 
-                if entry_cycle == head_cycle {
-                    // the cycles match, consume this entry
-                    // but preserve the safety bit and cycle
-                    self.entries[head_index].fetch_or(cap - 1, Ordering::AcqRel);
-                    return Some(entry & (cap - 1));
-                }
-
-                let new_entry = if (entry | cap) == entry_cycle {
-                    head_cycle ^ (!entry & cap)
-                } else {
-                    let new_entry = entry & !cap;
-                    if entry == new_entry {
-                        break;
+                // if the cycles match, we can read this slot
+                if slot_cycle == cycle {
+                    unsafe {
+                        // mark as unused, but preserve the safety bit
+                        self.slots
+                            .get_unchecked(head_index)
+                            .fetch_or(slots - 1, Ordering::AcqRel);
                     }
-                    new_entry
-                };
 
-                // the entry is from a newer cycle
-                if wrapping_cmp!(entry_cycle, >=, head_cycle) {
-                    break;
+                    return Some(slot & (slots - 1));
                 }
 
-                unsafe {
-                    match self
-                        .entries
-                        .get_unchecked(head_index)
-                        .compare_exchange_weak(
-                            entry,
-                            new_entry,
+                // if the slot is from an older cycle,
+                // we have to update it
+                if wrapping_cmp!(slot_cycle, <, cycle) {
+                    let new_slot = if (slot | slots) == slot_cycle {
+                        // the slot is unused, preserve the safety bit
+                        cycle ^ (!slot & slots)
+                    } else {
+                        // mark the slot as unsafe
+                        let new_entry = slot & !slots;
+
+                        if slot == new_entry {
+                            continue 'next;
+                        }
+
+                        new_entry
+                    };
+
+                    unsafe {
+                        if let Err(e) = self.slots.get_unchecked(head_index).compare_exchange_weak(
+                            slot,
+                            new_slot,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         ) {
-                        Ok(_) => break,
-                        Err(e) => {
-                            entry = e;
+                            slot = e;
+                            continue 'retry;
                         }
                     }
+
+                    let tail = self.tail.load(Ordering::Acquire);
+
+                    // if the head overtook the tail, push the tail forward
+                    if tail <= head + 1 {
+                        self.catchup(tail, head + 1);
+                        self.threshold.fetch_sub(1, Ordering::AcqRel);
+                        return None;
+                    }
+
+                    if self.threshold.fetch_sub(1, Ordering::AcqRel) <= 0 {
+                        return None;
+                    }
+
+                    continue 'next;
                 }
-            }
-
-            let tail = self.tail.load(Ordering::Acquire);
-
-            if tail <= head + 1 {
-                // the head overtook the tail, push the tail forward
-                self.catchup(tail, head + 1);
-                self.threshold.fetch_sub(1, Ordering::AcqRel);
-                return None;
-            }
-
-            if self.threshold.fetch_sub(1, Ordering::AcqRel) <= 0 {
-                return None;
             }
         }
     }
@@ -298,7 +306,7 @@ impl IndexQueue {
             let head = self.head.load(Ordering::Acquire);
 
             if self.tail.load(Ordering::Relaxed) == tail {
-                break dbg!(tail).wrapping_sub(dbg!(head));
+                break tail.wrapping_sub(head);
             }
         }
     }
