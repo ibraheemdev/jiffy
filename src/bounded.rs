@@ -94,6 +94,8 @@ impl<T> Drop for Inner<T> {
 /// Note: If set by a user, this will round up to 1 << 32.
 pub const MAX_CAPACITY: usize = (1 << 31) + 1;
 
+const SPIN_LIMIT: usize = 40;
+
 pub struct IndexQueue {
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
@@ -220,66 +222,84 @@ impl IndexQueue {
             let head_index = head & (slots - 1);
             let cycle = (head << 1) | (2 * slots - 1);
 
-            let mut slot = unsafe { self.slots.get_unchecked(head_index).load(Ordering::Acquire) };
+            let mut spun = 0;
 
-            'retry: loop {
-                let slot_cycle = slot | (2 * slots - 1);
+            'spin: loop {
+                let mut slot =
+                    unsafe { self.slots.get_unchecked(head_index).load(Ordering::Acquire) };
 
-                // if the cycles match, we can read this slot
-                if slot_cycle == cycle {
-                    unsafe {
-                        // mark as unused, but preserve the safety bit
-                        self.slots
-                            .get_unchecked(head_index)
-                            .fetch_or(slots - 1, Ordering::AcqRel);
-                    }
+                'retry: loop {
+                    let slot_cycle = slot | (2 * slots - 1);
 
-                    return Some(slot & (slots - 1));
-                }
-
-                // if the slot is from an older cycle,
-                // we have to update it
-                if wrapping_cmp!(slot_cycle, <, cycle) {
-                    let new_slot = if (slot | slots) == slot_cycle {
-                        // the slot is unused, preserve the safety bit
-                        cycle ^ (!slot & slots)
-                    } else {
-                        // mark the slot as unsafe
-                        let new_entry = slot & !slots;
-
-                        if slot == new_entry {
-                            continue 'next;
+                    // if the cycles match, we can read this slot
+                    if slot_cycle == cycle {
+                        unsafe {
+                            // mark as unused, but preserve the safety bit
+                            self.slots
+                                .get_unchecked(head_index)
+                                .fetch_or(slots - 1, Ordering::AcqRel);
                         }
 
-                        new_entry
-                    };
+                        return Some(slot & (slots - 1));
+                    }
 
-                    unsafe {
-                        if let Err(e) = self.slots.get_unchecked(head_index).compare_exchange_weak(
-                            slot,
-                            new_slot,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
-                            slot = e;
-                            continue 'retry;
+                    // if the slot is from an older cycle,
+                    // we have to update it
+                    if wrapping_cmp!(slot_cycle, <, cycle) {
+                        let new_slot = if (slot | slots) == slot_cycle {
+                            // spin for a bit before invalidating
+                            // the slot for writers from a previous
+                            // cycles in case they arrive soon,
+                            // alleviating unnecessary contention
+                            if spun <= SPIN_LIMIT {
+                                spun += 1;
+
+                                std::hint::spin_loop();
+                                continue 'spin;
+                            }
+
+                            // the slot is unused, preserve the safety bit
+                            cycle ^ (!slot & slots)
+                        } else {
+                            // mark the slot as unsafe
+                            let new_entry = slot & !slots;
+
+                            if slot == new_entry {
+                                continue 'next;
+                            }
+
+                            new_entry
+                        };
+
+                        unsafe {
+                            if let Err(e) =
+                                self.slots.get_unchecked(head_index).compare_exchange_weak(
+                                    slot,
+                                    new_slot,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                            {
+                                slot = e;
+                                continue 'retry;
+                            }
                         }
+
+                        let tail = self.tail.load(Ordering::Acquire);
+
+                        // if the head overtook the tail, push the tail forward
+                        if tail <= head + 1 {
+                            self.catchup(tail, head + 1);
+                            self.threshold.fetch_sub(1, Ordering::AcqRel);
+                            return None;
+                        }
+
+                        if self.threshold.fetch_sub(1, Ordering::AcqRel) <= 0 {
+                            return None;
+                        }
+
+                        continue 'next;
                     }
-
-                    let tail = self.tail.load(Ordering::Acquire);
-
-                    // if the head overtook the tail, push the tail forward
-                    if tail <= head + 1 {
-                        self.catchup(tail, head + 1);
-                        self.threshold.fetch_sub(1, Ordering::AcqRel);
-                        return None;
-                    }
-
-                    if self.threshold.fetch_sub(1, Ordering::AcqRel) <= 0 {
-                        return None;
-                    }
-
-                    continue 'next;
                 }
             }
         }
