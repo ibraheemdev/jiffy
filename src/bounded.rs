@@ -1,7 +1,7 @@
 use crate::utils::{CachePadded, DoubleCachePadded};
 
 use std::cell::UnsafeCell;
-use std::mem::{self, MaybeUninit};
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::{iter, ptr};
 
@@ -43,7 +43,10 @@ impl<T> Queue<T> {
     pub fn push(&self, value: T) -> Result<(), T> {
         match self.free.pop(self.order) {
             Some(elem) => unsafe {
-                (*self.slots.get_unchecked(elem).get()).write(value);
+                self.slots
+                    .get_unchecked(elem)
+                    .get()
+                    .write(MaybeUninit::new(value));
                 self.elements.push(elem, self.order);
                 Ok(())
             },
@@ -54,11 +57,7 @@ impl<T> Queue<T> {
     pub fn pop(&self) -> Option<T> {
         match self.elements.pop(self.order) {
             Some(elem) => unsafe {
-                let value = mem::replace(
-                    &mut *self.slots.get_unchecked(elem).get(),
-                    MaybeUninit::uninit(),
-                )
-                .assume_init();
+                let value = self.slots.get_unchecked(elem).get().read().assume_init();
                 self.free.push(elem, self.order);
                 Some(value)
             },
@@ -151,7 +150,6 @@ impl IndexQueue {
     pub fn push(&self, index: usize, order: usize) {
         let capacity = 1 << order;
         let slots = capacity * 2;
-        let index = index ^ (slots - 1);
 
         'next: loop {
             // acquire a slot
@@ -171,20 +169,22 @@ impl IndexQueue {
                 }
 
                 // we can safely read the entry if either:
-                // - the entry is safe and unused
-                // - the entry is marked as unsafe but
-                //   the head is still behind the tail
+                // - the entry is unused and safe
+                // - the entry is unused and _unsafe_ but
+                //   the head is behind the tail
                 if slot == slot_cycle
                     || (slot == slot_cycle ^ slots
                         && wrapping_cmp!(self.head.load(Ordering::Acquire), <=, tail))
                 {
-                    // mark the entry as safe
-                    let new_entry = cycle ^ index;
+                    // set the safe bit
+                    let new_slot = index ^ (slots - 1);
+                    // store the cycle
+                    let new_slot = cycle ^ new_slot;
 
                     unsafe {
                         if let Err(e) = self.slots.get_unchecked(tail_index).compare_exchange_weak(
                             slot,
-                            new_entry,
+                            new_slot,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         ) {
@@ -240,6 +240,7 @@ impl IndexQueue {
                                 .fetch_or(slots - 1, Ordering::AcqRel);
                         }
 
+                        // extract the index (ignore cycle and safety bit)
                         return Some(slot & (slots - 1));
                     }
 
