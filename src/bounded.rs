@@ -3,7 +3,7 @@ use crate::utils::{CachePadded, DoubleCachePadded};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
-use std::{iter, ptr};
+use std::{hint, iter, ptr};
 
 pub type Queue<T> = DoubleCachePadded<Inner<T>>;
 
@@ -171,24 +171,26 @@ impl IndexQueue {
                 // we can safely read the entry if either:
                 // - the entry is unused and safe
                 // - the entry is unused and _unsafe_ but
-                //   the head is behind the tail
+                //   the head is behind the tail, meaning
+                //   all active readers are still behind
                 if slot == slot_cycle
                     || (slot == slot_cycle ^ slots
                         && wrapping_cmp!(self.head.load(Ordering::Acquire), <=, tail))
                 {
-                    // set the safe bit
+                    // set the safety bit and cycle
                     let new_slot = index ^ (slots - 1);
-                    // store the cycle
                     let new_slot = cycle ^ new_slot;
 
                     unsafe {
-                        if let Err(e) = self.slots.get_unchecked(tail_index).compare_exchange_weak(
-                            slot,
-                            new_slot,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
-                            slot = e;
+                        if let Err(new) =
+                            self.slots.get_unchecked(tail_index).compare_exchange_weak(
+                                slot,
+                                new_slot,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                        {
+                            slot = new;
                             continue 'retry;
                         }
                     }
@@ -244,18 +246,15 @@ impl IndexQueue {
                         return Some(slot & (slots - 1));
                     }
 
-                    // if the slot is from an older cycle,
-                    // we have to update it
                     if wrapping_cmp!(slot_cycle, <, cycle) {
+                        // otherwise, we have to update the cycle
                         let new_slot = if (slot | slots) == slot_cycle {
                             // spin for a bit before invalidating
                             // the slot for writers from a previous
-                            // cycles in case they arrive soon,
-                            // alleviating unnecessary contention
+                            // cycle in case they arrive soon
                             if spun <= SPIN_LIMIT {
                                 spun += 1;
-
-                                std::hint::spin_loop();
+                                hint::spin_loop();
                                 continue 'spin;
                             }
 
@@ -266,14 +265,14 @@ impl IndexQueue {
                             let new_entry = slot & !slots;
 
                             if slot == new_entry {
-                                continue 'next;
+                                break 'retry;
                             }
 
                             new_entry
                         };
 
                         unsafe {
-                            if let Err(e) =
+                            if let Err(new) =
                                 self.slots.get_unchecked(head_index).compare_exchange_weak(
                                     slot,
                                     new_slot,
@@ -281,27 +280,30 @@ impl IndexQueue {
                                     Ordering::Acquire,
                                 )
                             {
-                                slot = e;
+                                slot = new;
                                 continue 'retry;
                             }
                         }
-
-                        let tail = self.tail.load(Ordering::Acquire);
-
-                        // if the head overtook the tail, push the tail forward
-                        if tail <= head + 1 {
-                            self.catchup(tail, head + 1);
-                            self.threshold.fetch_sub(1, Ordering::AcqRel);
-                            return None;
-                        }
-
-                        if self.threshold.fetch_sub(1, Ordering::AcqRel) <= 0 {
-                            return None;
-                        }
-
-                        continue 'next;
                     }
+
+                    break 'retry;
                 }
+
+                // check if the queue is empty
+                let tail = self.tail.load(Ordering::Acquire);
+
+                // if the head overtook the tail, push the tail forward
+                if tail <= head + 1 {
+                    self.catchup(tail, head + 1);
+                    self.threshold.fetch_sub(1, Ordering::AcqRel);
+                    return None;
+                }
+
+                if self.threshold.fetch_sub(1, Ordering::AcqRel) <= 0 {
+                    return None;
+                }
+
+                continue 'next;
             }
         }
     }
