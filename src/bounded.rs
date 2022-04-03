@@ -5,9 +5,7 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::{hint, iter, ptr};
 
-pub type Queue<T> = DoubleCachePadded<Inner<T>>;
-
-pub struct Inner<T> {
+pub struct Queue<T> {
     free: IndexQueue,
     elements: IndexQueue,
     slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
@@ -30,14 +28,14 @@ impl<T> Queue<T> {
             panic!("exceeded maximum queue capacity of {}", MAX_CAPACITY);
         }
 
-        DoubleCachePadded(Inner {
+        Queue {
             slots: iter::repeat_with(|| UnsafeCell::new(MaybeUninit::uninit()))
                 .take(capacity)
                 .collect(),
             free: IndexQueue::full(order),
             elements: IndexQueue::empty(order),
             order,
-        })
+        }
     }
 
     pub fn push(&self, value: T) -> Result<(), T> {
@@ -66,15 +64,15 @@ impl<T> Queue<T> {
     }
 
     pub fn len(&self) -> usize {
-        self.elements.len()
+        self.elements.len(self.order)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.elements.len() == 0
+        self.elements.len(self.order) == 0
     }
 
     pub fn is_full(&self) -> bool {
-        self.free.len() == 0
+        self.free.len(self.order) == 0
     }
 
     pub fn capacity(&self) -> usize {
@@ -82,10 +80,10 @@ impl<T> Queue<T> {
     }
 }
 
-impl<T> Drop for Inner<T> {
+impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
         while let Some(elem) = self.elements.pop(self.order) {
-            unsafe { ptr::drop_in_place(self.slots[elem].get()) }
+            unsafe { ptr::drop_in_place((*self.slots[elem].get()).as_mut_ptr()) }
         }
     }
 }
@@ -107,9 +105,9 @@ impl IndexQueue {
         let capacity = 1 << order;
 
         // the number of slots is double the capacity
-        // such that the last dequeuer can always locate
-        // an unused slot no farther than 2*capacity slots
-        // away from the last enqueuer
+        // such that the last reader can always locate
+        // an unused slot no farther than capacity*2 slots
+        // away from the last writer
         let slots = capacity * 2;
 
         IndexQueue {
@@ -129,22 +127,16 @@ impl IndexQueue {
         let capacity = 1 << order;
         let slots = capacity * 2;
 
-        let mut entries = iter::repeat(-1_isize as _)
-            .map(AtomicUsize::new)
-            .take(slots)
-            .collect::<Box<[_]>>();
+        let mut queue = IndexQueue::empty(order);
 
-        // initialize the first slots
         for i in 0..capacity {
-            entries[i] = AtomicUsize::new(i);
+            queue.slots[i] = AtomicUsize::new(i);
         }
 
-        IndexQueue {
-            head: CachePadded(AtomicUsize::new(0)),
-            tail: CachePadded(AtomicUsize::new(capacity)),
-            threshold: CachePadded(AtomicIsize::new(IndexQueue::threshold(capacity, slots))),
-            slots: CachePadded(entries),
-        }
+        *queue.tail.get_mut() = capacity;
+        *queue.threshold.get_mut() = IndexQueue::threshold(capacity, slots);
+
+        queue
     }
 
     pub fn push(&self, index: usize, order: usize) {
@@ -153,7 +145,7 @@ impl IndexQueue {
 
         'next: loop {
             // acquire a slot
-            let tail = self.tail.fetch_add(1, Ordering::AcqRel);
+            let tail = self.tail.fetch_add(1, Ordering::Relaxed);
             let tail_index = tail & (slots - 1);
             let cycle = (tail << 1) | (2 * slots - 1);
 
@@ -220,7 +212,7 @@ impl IndexQueue {
 
         'next: loop {
             // acquire a slot
-            let head = self.head.fetch_add(1, Ordering::AcqRel);
+            let head = self.head.fetch_add(1, Ordering::Relaxed);
             let head_index = head & (slots - 1);
             let cycle = (head << 1) | (2 * slots - 1);
 
@@ -323,13 +315,27 @@ impl IndexQueue {
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(&self, order: usize) -> usize {
+        let capacity = 1 << order;
+
         loop {
             let tail = self.tail.load(Ordering::Acquire);
             let head = self.head.load(Ordering::Acquire);
 
-            if self.tail.load(Ordering::Relaxed) == tail {
-                break tail.wrapping_sub(head);
+            // make sure we have consistent values to work with
+            if self.tail.load(Ordering::Acquire) == tail {
+                let hix = head & (capacity - 1);
+                let tix = tail & (capacity - 1);
+
+                break if hix < tix {
+                    tix - hix
+                } else if hix > tix {
+                    capacity - (hix - tix)
+                } else if tail == head {
+                    0
+                } else {
+                    capacity
+                };
             }
         }
     }

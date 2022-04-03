@@ -1,4 +1,6 @@
 use std::alloc::{self, Layout};
+use std::mem;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// Pads and aligns a value to the length of a cache line.
 #[cfg_attr(
@@ -74,5 +76,107 @@ impl<T> UnsafeDeref<T> for *mut T {
 
     unsafe fn deref_mut<'a>(self) -> &'a mut T {
         &mut *self
+    }
+}
+
+// Pads and aligns a value to the length of two cache lines.
+#[cfg_attr(
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "powerpc64",
+    ),
+    repr(align(256))
+)]
+#[cfg_attr(
+    any(
+        target_arch = "arm",
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "riscv64",
+    ),
+    repr(align(64))
+)]
+#[cfg_attr(target_arch = "s390x", repr(align(512)))]
+#[cfg_attr(
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "powerpc64",
+        target_arch = "arm",
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "riscv64",
+        target_arch = "s390x",
+    )),
+    repr(align(128))
+)]
+#[derive(Default)]
+pub struct DoubleCachePadded<T>(pub T);
+
+impl<T> std::ops::Deref for DoubleCachePadded<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for DoubleCachePadded<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+pub fn compose<T, const N: usize>(ptr: *mut T, tag: usize) -> *mut T {
+    debug_assert_eq!(
+        ptr as usize & mask::<N>(),
+        0,
+        "tag bits in raw pointer must be zeroed"
+    );
+
+    ((ptr as usize) | (mask::<N>() & tag)) as *mut _
+}
+
+pub fn decompose<T, const N: usize>(ptr: usize) -> (*mut T, usize) {
+    ((ptr & !mask::<N>()) as *mut _, ptr & mask::<N>())
+}
+
+pub fn lower_bits<T>() -> usize {
+    mem::align_of::<T>().trailing_zeros() as usize
+}
+
+fn mask<const N: usize>() -> usize {
+    (1 << N) - 1
+}
+
+pub trait FetchAddPtr<T> {
+    fn fetch_add(&self, n: usize, ordering: Ordering) -> *mut T;
+}
+
+impl<T> FetchAddPtr<T> for AtomicPtr<T> {
+    fn fetch_add(&self, n: usize, ordering: Ordering) -> *mut T {
+        let raw = unsafe { &*(self as *const _ as *const AtomicUsize) };
+        raw.fetch_add(n, ordering) as _
+    }
+}
+
+pub unsafe trait StrictProvenance: Sized {
+    fn addr(self) -> usize;
+    fn with_addr(self, addr: usize) -> Self;
+    fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self;
+}
+
+unsafe impl<T> StrictProvenance for *mut T {
+    fn addr(self) -> usize {
+        self as usize
+    }
+
+    fn with_addr(self, addr: usize) -> Self {
+        addr as Self
+    }
+
+    fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self {
+        self.with_addr(f(self.addr()))
     }
 }
