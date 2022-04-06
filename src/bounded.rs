@@ -246,7 +246,7 @@ impl IndexQueue {
                             // cycle in case they arrive soon
                             if spun <= SPIN_LIMIT {
                                 spun += 1;
-                                hint::spin_loop();
+                                (0..10.min(spun)).for_each(|_| hint::spin_loop());
                                 continue 'spin;
                             }
 
