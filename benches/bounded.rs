@@ -85,6 +85,56 @@ fn mpsc(c: &mut Criterion) {
         })
     });
 
+    group.bench_function("idea", |b| {
+        b.iter(|| {
+            let x = std::sync::Barrier::new(threads + 1);
+            let queue = jiffy::bounded::idea::Queue::new(messages);
+
+            crossbeam::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|_| {
+                        x.wait();
+                        for i in 0..messages / threads {
+                            queue.try_send(i).unwrap();
+                        }
+                    });
+                }
+
+                x.wait();
+                for _ in 0..messages {
+                    unsafe {
+                        queue.recv();
+                    }
+                }
+            })
+            .unwrap();
+        })
+    });
+
+    group.bench_function("sema", |b| {
+        b.iter(|| {
+            let x = std::sync::Barrier::new(threads + 1);
+            let queue = Chan::new(jiffy::bounded::sema::Queue::new(messages));
+
+            crossbeam::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|_| {
+                        x.wait();
+                        for i in 0..messages / threads {
+                            queue.send(|c| c.try_send(i)).unwrap();
+                        }
+                    });
+                }
+
+                x.wait();
+                for _ in 0..messages {
+                    queue.recv(|c| unsafe { c.try_recv() }).unwrap();
+                }
+            })
+            .unwrap();
+        })
+    });
+
     group.bench_function("crossbeam-queue", |b| {
         b.iter(|| {
             let x = std::sync::Barrier::new(threads + 1);

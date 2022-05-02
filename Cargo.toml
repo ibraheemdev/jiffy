@@ -16,7 +16,7 @@ crossbeam = "0.8.1"
 flume = "0.10.12"
 num_cpus = "1.13.1"
 # loo = { path = "../looqueue-rs" }
-# riffy = { git = "https://github.com/s1ck/riffy" }
+riffy = { git = "https://github.com/s1ck/riffy" }
 
 [dev-dependencies]
 criterion = "0.3.5"

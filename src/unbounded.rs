@@ -1,36 +1,138 @@
-use crate::utils::{self, CachePadded, FetchAddPtr, StrictProvenance, UnsafeDeref};
+use crate::utils::{CachePadded, FetchAddPtr, StrictProvenance, UnsafeDeref};
 
 use std::alloc::{self, Layout};
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::mem::{ManuallyDrop, MaybeUninit};
+use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering};
 
+const SPIN_READ: usize = 16;
+
 pub struct Queue<T> {
-    head: CachePadded<AtomicPtr<Block<T>>>,
+    head: CachePadded<Cell<(*mut Block<T>, usize)>>,
     tail: CachePadded<AtomicPtr<Block<T>>>,
     cached_tail: AtomicPtr<Block<T>>,
 }
 
+unsafe impl<T> Send for Queue<T> {}
+unsafe impl<T> Sync for Queue<T> {}
+
 impl<T> Queue<T> {
     pub fn new() -> Queue<T> {
         let block = Block::alloc();
-        let with_zero_index = (block as usize) | (INDEX_MASK & 0);
+        let with_zero_index = (block as usize) | (Block::INDEX_MASK & 0);
 
         Queue {
-            head: CachePadded(AtomicPtr::new(with_zero_index as _)),
+            head: CachePadded(Cell::new((block, 0))),
             tail: CachePadded(AtomicPtr::new(with_zero_index as _)),
             cached_tail: AtomicPtr::new(block),
         }
     }
 
+    pub fn pop(&self) -> Option<T> {
+        loop {
+            if self.is_empty() {
+                return None;
+            }
+
+            let (head, index) = self.head.get();
+
+            if index < Block::SLOTS {
+                unsafe {
+                    let slot = head.deref().slots.get_unchecked(index);
+
+                    for _ in 0..SPIN_READ {
+                        if slot.state.load(Ordering::Acquire) & Slot::WRITTEN == Slot::WRITTEN {
+                            let value = slot.value.get().read().assume_init();
+                            slot.state.fetch_add(Slot::CONSUMED, Ordering::Release);
+                            self.head.set((head, index + 1));
+                            return Some(value);
+                        }
+
+                        std::hint::spin_loop();
+                    }
+
+                    match slot.state.fetch_add(Slot::INVALID, Ordering::Acquire) {
+                        Slot::WRITTEN => {
+                            let value = slot.value.get().read().assume_init();
+                            slot.state.fetch_add(Slot::CONSUMED, Ordering::Release);
+                            self.head.set((head, index + 1));
+                            return Some(value);
+                        }
+                        _ => {
+                            slot.state.fetch_add(Slot::CONSUMED, Ordering::Release);
+                            self.head.set((head, index + 1));
+                            continue;
+                        }
+                    };
+                }
+            }
+
+            if index == Block::SLOTS {
+                self.head.set((head, index + 1));
+                unsafe { Block::try_reclaim::<false>(head, 0) };
+            }
+
+            let tail = self
+                .tail
+                .load(Ordering::Acquire)
+                .map_addr(|addr| addr & !Block::INDEX_MASK);
+
+            if head == tail {
+                return None;
+            }
+
+            unsafe {
+                let next = head.deref().next.load(Ordering::Acquire);
+                self.head.set((next, 0));
+
+                let state = head
+                    .deref()
+                    .reclamation
+                    .fetch_add(Block::HEAD_ADVANCED, Ordering::AcqRel);
+
+                if state == Block::CONSUMED | Block::TAIL_ADVANCED {
+                    let _ = Block::dealloc(head);
+                }
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let cached_tail = self.cached_tail.load(Ordering::Acquire);
+        let (head, head_index) = self.head.get();
+
+        if head != cached_tail {
+            return false;
+        }
+
+        let tail = self.tail.load(Ordering::Relaxed);
+        let tail_index = tail.addr() & Block::INDEX_MASK;
+        let tail = tail.map_addr(|addr| addr & !Block::INDEX_MASK);
+
+        if tail != cached_tail {
+            let _ = self.cached_tail.compare_exchange(
+                cached_tail,
+                tail,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+
+            return false;
+        }
+
+        tail_index <= head_index
+    }
+
     pub fn push(&self, value: T) {
         let value = ManuallyDrop::new(value);
+
         loop {
             let tail = self.tail.fetch_add(1, Ordering::Acquire);
-            let tail = tail.map_addr(|addr| addr & !INDEX_MASK);
-            let index = tail.addr() & INDEX_MASK;
+            let index = tail.addr() & Block::INDEX_MASK;
+            let tail = tail.map_addr(|addr| addr & !Block::INDEX_MASK);
 
-            if index < BLOCK_SIZE {
+            if index < Block::SLOTS {
                 unsafe {
                     let slot = tail.deref().slots.get_unchecked(index);
 
@@ -40,32 +142,107 @@ impl<T> Queue<T> {
                         .as_mut_ptr()
                         .copy_from_nonoverlapping(&*value, 1);
 
-                    let state = slot.state.fetch_add(Slot::WRITER, Ordering::Release);
-
-                    if matches!(state, Slot::INACTIVE | Slot::RESUME) {
-                        return;
-                    }
-
-                    if state == (Slot::NO_WRITER_YET | Slot::CONSUMED_OR_INVALIDATED | Slot::RESUME)
-                    {
-                        (*tail).try_reclaim(index + 1);
+                    match slot.state.fetch_add(Slot::WRITTEN, Ordering::Release) {
+                        Slot::WRITER_RESUME => {
+                            Block::try_reclaim::<true>(tail, index + 1);
+                        }
+                        Slot::UNINIT | Slot::RESUME => {
+                            return;
+                        }
+                        _ => {}
                     }
 
                     continue;
                 }
             }
+
+            let current = self.tail.load(Ordering::Relaxed);
+
+            if tail != current.map_addr(|addr| addr & !Block::INDEX_MASK) {
+                unsafe { Block::finish_write(tail, None) };
+                continue;
+            }
+
+            let next = unsafe { tail.deref().next.load(Ordering::Relaxed) };
+
+            if next.is_null() {
+                unsafe {
+                    let block_alloc = Block::alloc();
+                    block_alloc.deref_mut().slots[0] = Slot {
+                        value: UnsafeCell::new(MaybeUninit::new(ptr::read(&*value))),
+                        state: AtomicU8::new(Slot::WRITTEN),
+                    };
+
+                    let (res, next) = match tail.deref().next.compare_exchange(
+                        ptr::null_mut(),
+                        block_alloc,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => (Ok(()), block_alloc),
+                        Err(found) => (Err(()), found),
+                    };
+
+                    let next_tagged = (next as usize) | Block::INDEX_MASK & 1;
+                    let final_count =
+                        Block::compare_exchange(&self.tail, current, next_tagged as _, tail);
+
+                    let _ = self.cached_tail.compare_exchange(
+                        tail,
+                        next,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    );
+
+                    Block::finish_write(tail, final_count);
+
+                    match res {
+                        Ok(_) => return,
+                        Err(_) => {
+                            Block::dealloc(block_alloc);
+                            continue;
+                        }
+                    }
+                }
+            } else {
+                let next_tagged = (next as usize) | Block::INDEX_MASK & 1;
+                let final_count =
+                    Block::compare_exchange(&self.tail, current, next_tagged as _, tail);
+
+                let _ = self.cached_tail.compare_exchange(
+                    tail,
+                    next,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                );
+
+                unsafe { Block::finish_write(tail, final_count) };
+                continue;
+            }
         }
     }
 }
 
-const BLOCK_SIZE: usize = 1024;
-const INDEX_MASK: usize = (0x1 << 12) - 1;
-
-#[repr(align(4096))] // reserve 12 bits (0x1 << 12)
+#[repr(align(4096))] // reserve 12 bits (1 << 12)
 struct Block<T> {
-    slots: [Slot<T>; BLOCK_SIZE],
-    control: Control,
+    slots: [Slot<T>; Block::SLOTS],
+    push_count: AtomicU32,
+    reclamation: AtomicU8,
     next: AtomicPtr<Block<T>>,
+}
+
+impl Block<()> {
+    const SLOTS: usize = 1024;
+    const INDEX_MASK: usize = (1 << 12) - 1;
+    const FINAL_COUNT_SHIFT: u32 = 16;
+    const CURRENT_COUNT_MASK: u32 = 0xFFFF;
+
+    // all slots have been consumed
+    const CONSUMED: u8 = 0b001;
+    // the tail of the queue no longer points to this block
+    const TAIL_ADVANCED: u8 = 0b010;
+    // the head of the queue no longer points to this block
+    const HEAD_ADVANCED: u8 = 0b100;
 }
 
 impl<T> Block<T> {
@@ -80,16 +257,72 @@ impl<T> Block<T> {
         ptr as _
     }
 
-    fn try_reclaim(&self, start: usize) {
-        for slot in &self.slots[start..] {
-            if slot.state.load(Ordering::Acquire) & Slot::CONSUMED != Slot::CONSUMED {
-                if slot.state.fetch_add(Slot::RESUME, Ordering::Relaxed) & Slot::CONSUMED
-                    != Slot::CONSUMED
+    unsafe fn dealloc(block: *mut Block<T>) {
+        let layout = Layout::new::<Block<T>>();
+        alloc::dealloc(block as *mut u8, layout)
+    }
+
+    unsafe fn try_reclaim<const RECLAIMABLE: bool>(block: *mut Block<T>, start: usize) {
+        for slot in &block.deref().slots[start..] {
+            if slot.state.load(Ordering::Acquire) & Slot::READ != Slot::READ {
+                if slot.state.fetch_add(Slot::RESUME, Ordering::Relaxed) & Slot::READ != Slot::READ
                 {
                     return;
                 }
             }
         }
+
+        let flags = block
+            .deref()
+            .reclamation
+            .fetch_add(Block::CONSUMED, Ordering::AcqRel);
+
+        if RECLAIMABLE && flags == Block::TAIL_ADVANCED | Block::HEAD_ADVANCED {
+            let _ = Block::dealloc(block);
+        }
+    }
+
+    unsafe fn finish_write(block: *mut Block<T>, final_count: Option<u32>) {
+        let mask = match final_count {
+            Some(final_count) => (final_count << Block::FINAL_COUNT_SHIFT) + 1,
+            None => 1,
+        };
+
+        let prev_mask = block.deref().push_count.fetch_add(mask, Ordering::Relaxed);
+
+        let curr_count = (prev_mask & Block::CURRENT_COUNT_MASK) + 1;
+
+        if curr_count == final_count.unwrap_or(prev_mask >> Block::FINAL_COUNT_SHIFT) {
+            let flags = block
+                .deref()
+                .reclamation
+                .fetch_add(Block::TAIL_ADVANCED, Ordering::AcqRel);
+
+            if flags == Block::CONSUMED | Block::HEAD_ADVANCED {
+                let _ = Block::dealloc(block);
+            }
+        }
+    }
+
+    fn compare_exchange(
+        block_ptr: &AtomicPtr<Block<T>>,
+        mut current_tagged: *mut Block<T>,
+        new: *mut Block<T>,
+        current: *mut Block<T>,
+    ) -> Option<u32> {
+        while let Err(found) =
+            block_ptr.compare_exchange(current_tagged, new, Ordering::Release, Ordering::Relaxed)
+        {
+            // the pointer itself changed
+            if found.map_addr(|addr| addr & !Block::INDEX_MASK) != current {
+                return None;
+            }
+
+            // the tag changed
+            current_tagged = found;
+        }
+
+        Some((current_tagged.addr() & Block::INDEX_MASK) as _)
     }
 }
 
@@ -99,16 +332,28 @@ struct Slot<T> {
 }
 
 impl Slot<()> {
-    const INACTIVE: u8 = 0;
-    const RESUME: u8 = 0b0001;
-    const WRITER: u8 = 0b0010;
-    const CONSUMED_OR_INVALIDATED: u8 = 0b0100;
-    const NO_WRITER_YET: u8 = 0b1000;
-    const CONSUMED: u8 = Slot::WRITER | Slot::CONSUMED_OR_INVALIDATED;
-}
-
-struct Control {
-    push: AtomicU32,
-    pop: AtomicU32,
-    reclaim: AtomicU32,
+    // the slot is unitialized
+    const UNINIT: u8 = 0b0000;
+    // an element was written to the slot
+    const WRITTEN: u8 = 0b0001;
+    // a reader attempted to read the slot and found it
+    // uninitialized; the slot is invalid for further use.
+    //
+    // note that CONSUMED still needs to be set to complete
+    // the invalidation
+    const INVALID: u8 = 0b1000;
+    // the slot was consumed by a reader.
+    //
+    // this means that there was either a successful
+    // or failed read attempt of this slot; the slot
+    // will no longer be accessed
+    const CONSUMED: u8 = 0b0100;
+    // the value was successfully read from this slot
+    const READ: u8 = Slot::WRITTEN | Slot::CONSUMED;
+    // indicates that a future reader/writer should
+    // resume reclamation of subsequent slots
+    const RESUME: u8 = 0b0010;
+    // the slot was invalidated by a reader and the
+    // writer must resume reclaming the block
+    const WRITER_RESUME: u8 = Slot::INVALID | Slot::CONSUMED | Slot::RESUME;
 }
